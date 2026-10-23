@@ -12,7 +12,7 @@ npm install             # also runs `prisma generate` (postinstall)
 cp .env.example .env    # then set JWT_ACCESS_SECRET: openssl rand -base64 48
 npm run db:up           # Postgres in Docker on localhost:5433
 npm run db:migrate      # apply migrations
-npm run db:seed         # demo data (users alice/bob/carol, password: password123)
+npm run db:seed         # demo data (alice/bob/carol, password123 locally; see "Demo data in production")
 npm run start:dev       # http://localhost:3001
 ```
 
@@ -135,6 +135,21 @@ From then on every push to `main` deploys. Until the variables exist, the deploy
 - **Workload Identity Federation** only accepts GitHub tokens for `mognoose/keikkone-backend` on `refs/heads/main`. Pull requests and forks can't obtain credentials. Each login lasts one hour, and nothing long-lived is stored in GitHub.
 - **Database credentials never touch GitHub.** They live in Secret Manager, and Cloud Run injects them at runtime.
 - **Rotating a secret:** `gcloud secrets versions add <name> --data-file=-`, then redeploy.
+
+### Demo data in production
+
+Genres reach every environment through a migration. Demo users, venues, artists and events come from `prisma/seed.ts`. On anything other than a local database, the seed refuses to run without `SEED_PASSWORD` (at least 12 characters), so the public `password123` never reaches a server. Run it from your laptop against Neon's direct URL:
+
+```zsh
+export NEON_PROFILE=personal
+SEED_PASSWORD="$(openssl rand -base64 18)"; echo "$SEED_PASSWORD"   # save it in 1Password
+DATABASE_URL="$(neonctl cs --project-id round-art-58327331)" \
+  SEED_PASSWORD="$SEED_PASSWORD" npx tsx prisma/seed.ts
+```
+
+- **Safe to re-run:** demo events are recreated, and a new `SEED_PASSWORD` rotates the demo users' password.
+- **Logins:** `alice@example.com`, `bob@example.com`, `carol@example.com`.
+- **Removing the demo data later:** delete those three users and their events.
 
 ### Manual fallback
 

@@ -1,7 +1,11 @@
 /**
- * Idempotent dev seed: genres, venues, artists, three demo users and a set of
- * upcoming events. Safe to re-run; demo events are recreated each time.
- * Demo users all have the password "password123".
+ * Idempotent demo data: venues, artists, three demo users (alice, bob, carol)
+ * and upcoming events. Safe to re-run; demo events are recreated each time.
+ * Genres are not seeded here: they ship as a migration (reference data).
+ *
+ * Password: "password123" on a local database. Any other database requires
+ * SEED_PASSWORD, so a known password never ends up on a public server:
+ *   SEED_PASSWORD='...' DATABASE_URL='<neon direct url>' npx tsx prisma/seed.ts
  */
 import 'dotenv/config';
 import { PrismaPg } from '@prisma/adapter-pg';
@@ -10,42 +14,35 @@ import { PrismaClient } from '../src/generated/prisma/client.js';
 import { collectHashtags } from '../src/common/hashtags.js';
 import { slugify } from '../src/common/slug.js';
 
-if (process.env.NODE_ENV === 'production') {
-  throw new Error(
-    'Refusing to seed demo data (password123 users) into production',
-  );
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) throw new Error('DATABASE_URL is not set');
+
+// Decided by where the database is, not by NODE_ENV: running this from a
+// laptop against Neon has no NODE_ENV=production to trip over.
+const LOCAL_HOSTS = ['localhost', '127.0.0.1', '::1', 'host.docker.internal'];
+const dbHost = new URL(DATABASE_URL).hostname;
+const isLocalDb = LOCAL_HOSTS.includes(dbHost);
+
+function resolvePassword(): string {
+  const password =
+    process.env.SEED_PASSWORD ?? (isLocalDb ? 'password123' : undefined);
+  if (!password) {
+    throw new Error(
+      `Refusing to seed ${dbHost} with the default demo password. Set SEED_PASSWORD.`,
+    );
+  }
+  if (!isLocalDb && password.length < 12) {
+    throw new Error(
+      'SEED_PASSWORD must be at least 12 characters for a non-local database',
+    );
+  }
+  return password;
 }
+const password = resolvePassword();
 
 const prisma = new PrismaClient({
-  adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL! }),
+  adapter: new PrismaPg({ connectionString: DATABASE_URL }),
 });
-
-const GENRES = [
-  'Rock',
-  'Metal',
-  'Heavy Metal',
-  'Death Metal',
-  'Black Metal',
-  'Doom Metal',
-  'Symphonic Metal',
-  'Punk',
-  'Hardcore',
-  'Indie',
-  'Alternative',
-  'Pop',
-  'Suomipop',
-  'Hip Hop',
-  'Electronic',
-  'Techno',
-  'Jazz',
-  'Blues',
-  'Folk',
-  'Classical',
-  'Iskelmä',
-  'Reggae',
-  'Country',
-  'Soul',
-];
 
 const VENUES = [
   {
@@ -118,16 +115,14 @@ const daysFromNow = (days: number, hour = 19) => {
 };
 
 async function main() {
-  for (const name of GENRES) {
-    await prisma.genre.upsert({
-      where: { slug: slugify(name) },
-      create: { name, slug: slugify(name) },
-      update: {},
-    });
-  }
   const genres = new Map(
     (await prisma.genre.findMany()).map((g) => [g.name, g.id]),
   );
+  if (genres.size === 0) {
+    throw new Error(
+      'No genres found. Run migrations first (they include the genre list).',
+    );
+  }
 
   for (const v of VENUES) {
     const slug = slugify(`${v.name} ${v.city}`);
@@ -160,12 +155,13 @@ async function main() {
     (await prisma.artist.findMany()).map((a) => [a.name, a.id]),
   );
 
-  const passwordHash = await argon2.hash('password123');
+  const passwordHash = await argon2.hash(password);
   for (const u of USERS) {
     await prisma.user.upsert({
       where: { username: u.username },
       create: { ...u, email: `${u.username}@example.com`, passwordHash },
-      update: {},
+      // Re-seeding with a new SEED_PASSWORD rotates the demo password.
+      update: { passwordHash },
     });
   }
   const users = new Map(
@@ -355,7 +351,7 @@ async function main() {
   }
 
   console.log(
-    `Seeded ${GENRES.length} genres, ${VENUES.length} venues, ${ARTISTS.length} artists, ${USERS.length} users, ${events.length} events.`,
+    `Seeded ${dbHost}: ${VENUES.length} venues, ${ARTISTS.length} artists, ${USERS.length} users, ${events.length} events.`,
   );
 }
 
