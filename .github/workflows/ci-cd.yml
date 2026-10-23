@@ -1,0 +1,102 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Least privilege by default; the deploy job adds what it needs.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: keikkone
+          POSTGRES_PASSWORD: keikkone
+          POSTGRES_DB: keikkone_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U keikkone"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - run: npm ci
+
+      # The e2e suite reads .env.test (git-ignored), so CI writes its own.
+      - name: Write .env.test
+        run: |
+          cat > .env.test <<'ENV'
+          NODE_ENV=test
+          DATABASE_URL=postgresql://keikkone:keikkone@localhost:5432/keikkone_test?schema=public
+          JWT_ACCESS_SECRET=ci-only-secret-that-is-at-least-32-characters
+          ENV
+
+      - run: npm run lint
+      - run: npx tsc --noEmit
+      - run: npm test
+      - run: npm run test:e2e
+      - run: npm run build
+
+  deploy:
+    needs: test
+    # Only pushes to main deploy, and only once the GCP repository variables
+    # exist (see scripts/gcp-setup.sh). Until then this job is skipped.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.GCP_WIF_PROVIDER != ''
+    runs-on: ubuntu-latest
+    # A GitHub environment: add "required reviewers" to it in the repo settings
+    # if you ever want a manual approval click before production deploys.
+    environment:
+      name: production
+      url: ${{ steps.release.outputs.url }}
+    # Never run two deploys at once; a newer push waits for the current one.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write # lets the job request a GitHub OIDC token for Workload Identity
+    env:
+      GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+      CORS_ORIGINS: ${{ vars.CORS_ORIGINS }}
+      SWAGGER_ENABLED: ${{ vars.SWAGGER_ENABLED }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Exchanges GitHub's short-lived OIDC token for 1-hour Google credentials
+      # of the deployer service account. No long-lived key is stored anywhere.
+      - uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Build and push image
+        id: image
+        run: |
+          source scripts/gcp-common.sh
+          IMAGE="$IMAGE_BASE:$GITHUB_SHA"
+          gcloud auth configure-docker "$REGION-docker.pkg.dev" --quiet
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+      - name: Migrate and deploy
+        id: release
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+        run: |
+          set -o pipefail
+          scripts/release.sh "$IMAGE" | tee release.log
+          echo "url=$(grep -o 'https://[^ ]*\.run\.app' release.log | head -1)" >> "$GITHUB_OUTPUT"

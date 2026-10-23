@@ -1,6 +1,7 @@
 services:
   db:
-    image: postgres:17-alpine
+    # Same major version as the Neon production database
+    image: postgres:18-alpine
     environment:
       POSTGRES_USER: keikkone
       POSTGRES_PASSWORD: keikkone
@@ -8,7 +9,9 @@ services:
     ports:
       - '5433:5432'
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # Postgres 18 images keep data in a versioned subfolder (18/docker), so
+      # the volume mounts the parent; the old /data path makes 18 refuse to start.
+      - pgdata:/var/lib/postgresql
       # Creates the separate e2e test database on first start
       - ./docker/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql:ro
     healthcheck:

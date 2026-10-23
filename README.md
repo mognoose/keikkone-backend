@@ -87,52 +87,65 @@ Pagination: responses are `{ items, nextCursor }`. Pass `nextCursor` back as `cu
 - **Tokens.** Access tokens are 15-minute JWTs, checked without a DB lookup. Refresh tokens are random strings stored as SHA-256 hashes and rotated on every use. Replaying a used refresh token revokes all of that user's sessions. A role change only takes effect after the next refresh or login.
 - **Search** uses `ILIKE` backed by `pg_trgm` GIN indexes, declared in `schema.prisma` so migrations don't drift.
 
-## Deployment: Cloud Run + Neon
+## Deployment: GitHub Actions → Cloud Run + Neon
 
 ```
-GitHub ── CI (lint, unit, e2e) on every push
-laptop ── scripts/deploy.sh ──▶ Cloud Build (image) ──▶ Cloud Run Job: prisma migrate deploy
-                                                     └─▶ Cloud Run service keikkone-api ──▶ Neon Postgres
+push / PR ─▶ test job: lint, typecheck, unit, e2e (Postgres 18), build
+push to main, tests green ─▶ deploy job
+   1. Google login via Workload Identity Federation (no stored keys)
+   2. docker build + push to Artifact Registry (image tag = commit sha)
+   3. Cloud Run Job keikkone-migrate: prisma migrate deploy
+   4. Cloud Run service keikkone-api: new revision, then /health check
 ```
 
-Both run in Frankfurt: Cloud Run `europe-west3` and Neon `aws-eu-central-1`. Neon has no Nordic region, and each API request makes several DB round trips, so the app sits next to the database.
+Everything runs in Frankfurt: Cloud Run `europe-west3`, next to Neon `aws-eu-central-1` (Neon has no Nordic region, and each request makes several DB round trips). Local Docker, CI and Neon all run Postgres 18.
 
 ### One-time setup
 
-1. **Neon:** create a project in *AWS Europe Central 1 (Frankfurt)* with Postgres 17. Copy two connection strings from the dashboard: the **pooled** one (host contains `-pooler`) and the **direct** one.
-2. **Google Cloud:** create a project with billing enabled, using your *personal* Google account.
-3. **A dedicated gcloud configuration.** The scripts only ever use this configuration, never the currently active one, so they can't deploy to a work account by mistake:
+1. **Neon project** in `aws-eu-central-1` running Postgres 18 (existing project `round-art-58327331`).
+   `neonctl projects …` commands need `--org-id`, otherwise they open an interactive org picker. That breaks pipes.
+2. **Google Cloud project** with billing, on your personal account, plus a dedicated gcloud configuration. The scripts only ever use this configuration, never the currently active one:
    ```zsh
    gcloud config configurations create keikkone
-   gcloud auth login                         # personal account
+   gcloud auth login                                  # personal account
    gcloud config set project <project-id>
-   gcloud config configurations activate default   # switch back to work
+   gcloud config configurations activate default      # back to work config
    ```
-4. Run `scripts/gcp-setup.sh`. It enables APIs, creates the image registry, a runtime service account, and the secrets (it asks for the two Neon URLs and generates the JWT secret). It's safe to re-run.
+3. **Neon URLs into Secret Manager.** Piping keeps them off screen and out of shell history:
+   ```zsh
+   export NEON_PROFILE=personal CLOUDSDK_ACTIVE_CONFIG_NAME=keikkone
+   gcloud services enable secretmanager.googleapis.com
+   neonctl cs --project-id round-art-58327331 --pooled | tr -d '\n' \
+     | gcloud secrets create keikkone-database-url --data-file=-
+   neonctl cs --project-id round-art-58327331 | tr -d '\n' \
+     | gcloud secrets create keikkone-direct-url --data-file=-
+   unset CLOUDSDK_ACTIVE_CONFIG_NAME
+   ```
+4. **`scripts/gcp-setup.sh`** (idempotent). It enables APIs, creates the registry, the two service accounts, the JWT secret and the GitHub trust. At the end it prints three values.
+5. **Add them as repository variables** (not secrets) under Settings → Secrets and variables → Actions → Variables: `GCP_PROJECT_ID`, `GCP_WIF_PROVIDER`, `GCP_DEPLOYER_SA`. Optional: `CORS_ORIGINS` (default `*`) and `SWAGGER_ENABLED` (default `true`).
 
-### Each deploy
+From then on every push to `main` deploys. Until the variables exist, the deploy job is skipped.
 
-```zsh
-git commit ...                                     # deploy.sh refuses uncommitted changes
-CORS_ORIGINS="https://your-frontend.example" scripts/deploy.sh
-```
+### Security model
 
-The script builds the image remotely with Cloud Build, so no local Docker is needed and the build is amd64 even from an M-series Mac. It then runs migrations as a Cloud Run Job using the same image, deploys the service, and checks `/health`. If migrations fail, the deploy stops and the old version keeps serving.
+- **Two service accounts.**
+  - `keikkone-deployer` is what GitHub logs in as. It can push images and manage Cloud Run, but it **cannot read secrets**.
+  - `keikkone-run` is what the API and the migration job run as. It can **only** read the three secrets.
+  - A compromised workflow therefore can't read the database password.
+- **Workload Identity Federation** only accepts GitHub tokens for `mognoose/keikkone-backend` on `refs/heads/main`. Pull requests and forks can't obtain credentials. Each login lasts one hour, and nothing long-lived is stored in GitHub.
+- **Database credentials never touch GitHub.** They live in Secret Manager, and Cloud Run injects them at runtime.
+- **Rotating a secret:** `gcloud secrets versions add <name> --data-file=-`, then redeploy.
 
-Optional env vars for `deploy.sh`: `CORS_ORIGINS` (default `*`) and `SWAGGER_ENABLED` (default `true`).
+### Manual fallback
 
-### How it's wired
+`scripts/deploy.sh` builds the committed HEAD with Cloud Build and runs the same `scripts/release.sh` as the workflow. Use it if GitHub Actions is unavailable.
 
-- **Secrets** (`keikkone-database-url`, `keikkone-direct-url`, `keikkone-jwt-access-secret`) live in Secret Manager. Only the `keikkone-run` service account can read them. To rotate one: `gcloud secrets versions add <name> --data-file=-`, then redeploy.
-- **Pooled vs direct URL:** the app uses Neon's pooled URL (PgBouncer, many short-lived connections from many instances). Migrations use the direct URL (`DIRECT_URL`, read by `prisma.config.ts`), because PgBouncer doesn't support the locks that `migrate` takes.
-- **Scaling:** 0–3 instances. Idle costs nothing, but the first request after idling takes a second or two (cold start, plus Neon waking up). Use `--min-instances 1` for always-warm, at roughly €10–15/month.
-- `TRUST_PROXY_HOPS=1` makes rate limiting see real client IPs behind Google's load balancer.
-- **Image size:** ~200 MB of the image is the Prisma CLI, kept so the same image can run migrations.
+### Notes
 
-### Troubleshooting
-
-- **Cloud Build "permission denied" on a new project:** newer projects run builds as the Compute Engine default service account. Grant it `roles/cloudbuild.builds.builder`.
-- **Local amd64 builds** (`docker build --platform linux/amd64`) are extremely slow on Apple Silicon under emulation. Let Cloud Build do it, and use a plain `docker build .` for local checks.
+- **Pooled vs direct URL:** the app uses Neon's pooled URL. Migrations use the direct one (`DIRECT_URL`, read by `prisma.config.ts`), because PgBouncer doesn't support the locks `migrate` takes. **Never put production URLs in `.env`**: `npm run db:migrate` runs `migrate dev`, which may reset its target.
+- **Scaling:** 0–3 instances. Idle costs nothing, but the first request after idling takes a second or two (Cloud Run cold start plus Neon waking up). `--min-instances 1` in `scripts/release.sh` keeps one instance warm, at roughly €10–15/month.
+- **Approval:** add "required reviewers" to the `production` environment in GitHub to approve each deploy manually.
+- **Local amd64 builds** (`docker build --platform linux/amd64`) crawl on Apple Silicon. CI and Cloud Build build natively, so use a plain `docker build .` for local checks.
 
 ## Gotchas found while setting this up
 
