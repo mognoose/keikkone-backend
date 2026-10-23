@@ -1,0 +1,259 @@
+generator client {
+  provider        = "prisma-client"
+  output          = "../src/generated/prisma"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  extensions = [pg_trgm]
+}
+
+// ─── Users & auth ────────────────────────────────────────────────────────────
+
+enum Role {
+  USER
+  ADMIN
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  email        String   @unique
+  username     String   @unique
+  displayName  String
+  avatarUrl    String?
+  passwordHash String
+  role         Role     @default(USER)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  refreshTokens    RefreshToken[]
+  sentRequests     FriendRequest[] @relation("SentRequests")
+  receivedRequests FriendRequest[] @relation("ReceivedRequests")
+  friendships      Friendship[]    @relation("UserFriendships")
+  friendOf         Friendship[]    @relation("FriendOf")
+  createdEvents    Event[]
+  attendances      Attendance[]
+
+  @@index([username(ops: raw("gin_trgm_ops"))], type: Gin, map: "User_username_trgm_idx")
+  @@index([displayName(ops: raw("gin_trgm_ops"))], type: Gin, map: "User_displayName_trgm_idx")
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ─── Friends ─────────────────────────────────────────────────────────────────
+
+enum FriendRequestStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+}
+
+model FriendRequest {
+  id          String              @id @default(uuid()) @db.Uuid
+  requesterId String              @db.Uuid
+  addresseeId String              @db.Uuid
+  status      FriendRequestStatus @default(PENDING)
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  requester User @relation("SentRequests", fields: [requesterId], references: [id], onDelete: Cascade)
+  addressee User @relation("ReceivedRequests", fields: [addresseeId], references: [id], onDelete: Cascade)
+
+  @@unique([requesterId, addresseeId])
+  @@index([addresseeId, status])
+}
+
+/// Stored as two directed rows per friendship (A→B and B→A) so that
+/// "friends of X" is a single indexed lookup on userId.
+model Friendship {
+  userId    String   @db.Uuid
+  friendId  String   @db.Uuid
+  createdAt DateTime @default(now())
+
+  user   User @relation("UserFriendships", fields: [userId], references: [id], onDelete: Cascade)
+  friend User @relation("FriendOf", fields: [friendId], references: [id], onDelete: Cascade)
+
+  @@id([userId, friendId])
+  @@index([friendId])
+}
+
+// ─── Catalog ─────────────────────────────────────────────────────────────────
+
+model Genre {
+  id   String @id @default(uuid()) @db.Uuid
+  name String @unique
+  slug String @unique
+
+  artists ArtistGenre[]
+  events  EventGenre[]
+}
+
+model Artist {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String
+  slug        String   @unique
+  description String?
+  imageUrl    String?
+  createdAt   DateTime @default(now())
+
+  genres ArtistGenre[]
+  events EventArtist[]
+
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "Artist_name_trgm_idx")
+}
+
+model ArtistGenre {
+  artistId String @db.Uuid
+  genreId  String @db.Uuid
+
+  artist Artist @relation(fields: [artistId], references: [id], onDelete: Cascade)
+  genre  Genre  @relation(fields: [genreId], references: [id], onDelete: Cascade)
+
+  @@id([artistId, genreId])
+}
+
+model Venue {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String   @unique
+  address   String
+  city      String
+  country   String   @default("FI")
+  latitude  Float?
+  longitude Float?
+  capacity  Int
+  createdAt DateTime @default(now())
+
+  events Event[]
+
+  @@index([capacity])
+  @@index([city])
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "Venue_name_trgm_idx")
+}
+
+model Hashtag {
+  id     String         @id @default(uuid()) @db.Uuid
+  tag    String         @unique
+  events EventHashtag[]
+}
+
+// ─── Events ──────────────────────────────────────────────────────────────────
+
+enum EventStatus {
+  SCHEDULED
+  POSTPONED
+  CANCELLED
+}
+
+enum AccessibilityFeature {
+  WHEELCHAIR_ACCESS
+  STEP_FREE_ACCESS
+  ACCESSIBLE_TOILET
+  HEARING_LOOP
+  SEATING_AVAILABLE
+  COMPANION_TICKET
+  QUIET_SPACE
+  SIGN_LANGUAGE
+}
+
+model Event {
+  id                 String                 @id @default(uuid()) @db.Uuid
+  title              String
+  description        String                 @default("")
+  startsAt           DateTime
+  endsAt             DateTime?
+  doorsAt            DateTime?
+  venueId            String                 @db.Uuid
+  createdById        String                 @db.Uuid
+  ticketUrl          String?
+  /// Prices are stored in cents to avoid floating point rounding.
+  priceMinCents      Int?
+  priceMaxCents      Int?
+  currency           String                 @default("EUR")
+  /// null = all ages, 18 = K-18 etc.
+  minAge             Int?
+  accessibility      AccessibilityFeature[] @default([])
+  accessibilityNotes String?
+  coverImageUrl      String?
+  status             EventStatus            @default(SCHEDULED)
+  createdAt          DateTime               @default(now())
+  updatedAt          DateTime               @updatedAt
+
+  venue       Venue          @relation(fields: [venueId], references: [id])
+  createdBy   User           @relation(fields: [createdById], references: [id])
+  artists     EventArtist[]
+  genres      EventGenre[]
+  hashtags    EventHashtag[]
+  attendances Attendance[]
+
+  @@index([startsAt])
+  @@index([venueId])
+  @@index([priceMinCents])
+  @@index([title(ops: raw("gin_trgm_ops"))], type: Gin, map: "Event_title_trgm_idx")
+}
+
+model EventArtist {
+  eventId     String  @db.Uuid
+  artistId    String  @db.Uuid
+  isHeadliner Boolean @default(false)
+  sortOrder   Int     @default(0)
+
+  event  Event  @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  artist Artist @relation(fields: [artistId], references: [id])
+
+  @@id([eventId, artistId])
+  @@index([artistId])
+}
+
+model EventGenre {
+  eventId String @db.Uuid
+  genreId String @db.Uuid
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  genre Genre @relation(fields: [genreId], references: [id])
+
+  @@id([eventId, genreId])
+  @@index([genreId])
+}
+
+model EventHashtag {
+  eventId   String @db.Uuid
+  hashtagId String @db.Uuid
+
+  event   Event   @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  hashtag Hashtag @relation(fields: [hashtagId], references: [id])
+
+  @@id([eventId, hashtagId])
+  @@index([hashtagId])
+}
+
+enum AttendanceStatus {
+  GOING
+  INTERESTED
+}
+
+model Attendance {
+  userId    String           @db.Uuid
+  eventId   String           @db.Uuid
+  status    AttendanceStatus
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  @@id([userId, eventId])
+  @@index([eventId, status])
+}

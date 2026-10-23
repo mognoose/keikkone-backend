@@ -1,0 +1,16 @@
+node_modules
+dist
+coverage
+.env
+.env.*
+!.env.example
+src/generated
+.git
+.github
+.agents
+.claude
+.windsurf
+skills-lock.json
+docker
+test
+*.md
