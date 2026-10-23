@@ -1,7 +1,15 @@
 # syntax=docker/dockerfile:1
 
+# ---- base: shared OS packages ----
+FROM node:24-slim AS base
+# Prisma's migration engine is a native binary that links against OpenSSL,
+# which the slim image doesn't ship.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssl \
+ && rm -rf /var/lib/apt/lists/*
+
 # ---- build: install all deps, generate the Prisma client, compile TS ----
-FROM node:24-slim AS build
+FROM base AS build
 WORKDIR /app
 
 # Copy only what `npm ci` needs first, so this layer stays cached until
@@ -16,8 +24,9 @@ RUN npm run build \
  && npm prune --omit=dev
 
 # ---- runtime: production deps + compiled output only ----
-FROM node:24-slim AS runtime
-ENV NODE_ENV=production
+FROM base AS runtime
+ENV NODE_ENV=production \
+    NPM_CONFIG_UPDATE_NOTIFIER=false
 WORKDIR /app
 
 COPY --from=build --chown=node:node /app/package.json /app/prisma.config.ts ./

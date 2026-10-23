@@ -87,6 +87,53 @@ Pagination: responses are `{ items, nextCursor }`. Pass `nextCursor` back as `cu
 - **Tokens.** Access tokens are 15-minute JWTs, checked without a DB lookup. Refresh tokens are random strings stored as SHA-256 hashes and rotated on every use. Replaying a used refresh token revokes all of that user's sessions. A role change only takes effect after the next refresh or login.
 - **Search** uses `ILIKE` backed by `pg_trgm` GIN indexes, declared in `schema.prisma` so migrations don't drift.
 
+## Deployment: Cloud Run + Neon
+
+```
+GitHub ── CI (lint, unit, e2e) on every push
+laptop ── scripts/deploy.sh ──▶ Cloud Build (image) ──▶ Cloud Run Job: prisma migrate deploy
+                                                     └─▶ Cloud Run service keikkone-api ──▶ Neon Postgres
+```
+
+Both run in Frankfurt: Cloud Run `europe-west3` and Neon `aws-eu-central-1`. Neon has no Nordic region, and each API request makes several DB round trips, so the app sits next to the database.
+
+### One-time setup
+
+1. **Neon:** create a project in *AWS Europe Central 1 (Frankfurt)* with Postgres 17. Copy two connection strings from the dashboard: the **pooled** one (host contains `-pooler`) and the **direct** one.
+2. **Google Cloud:** create a project with billing enabled, using your *personal* Google account.
+3. **A dedicated gcloud configuration.** The scripts only ever use this configuration, never the currently active one, so they can't deploy to a work account by mistake:
+   ```zsh
+   gcloud config configurations create keikkone
+   gcloud auth login                         # personal account
+   gcloud config set project <project-id>
+   gcloud config configurations activate default   # switch back to work
+   ```
+4. Run `scripts/gcp-setup.sh`. It enables APIs, creates the image registry, a runtime service account, and the secrets (it asks for the two Neon URLs and generates the JWT secret). It's safe to re-run.
+
+### Each deploy
+
+```zsh
+git commit ...                                     # deploy.sh refuses uncommitted changes
+CORS_ORIGINS="https://your-frontend.example" scripts/deploy.sh
+```
+
+The script builds the image remotely with Cloud Build, so no local Docker is needed and the build is amd64 even from an M-series Mac. It then runs migrations as a Cloud Run Job using the same image, deploys the service, and checks `/health`. If migrations fail, the deploy stops and the old version keeps serving.
+
+Optional env vars for `deploy.sh`: `CORS_ORIGINS` (default `*`) and `SWAGGER_ENABLED` (default `true`).
+
+### How it's wired
+
+- **Secrets** (`keikkone-database-url`, `keikkone-direct-url`, `keikkone-jwt-access-secret`) live in Secret Manager. Only the `keikkone-run` service account can read them. To rotate one: `gcloud secrets versions add <name> --data-file=-`, then redeploy.
+- **Pooled vs direct URL:** the app uses Neon's pooled URL (PgBouncer, many short-lived connections from many instances). Migrations use the direct URL (`DIRECT_URL`, read by `prisma.config.ts`), because PgBouncer doesn't support the locks that `migrate` takes.
+- **Scaling:** 0–3 instances. Idle costs nothing, but the first request after idling takes a second or two (cold start, plus Neon waking up). Use `--min-instances 1` for always-warm, at roughly €10–15/month.
+- `TRUST_PROXY_HOPS=1` makes rate limiting see real client IPs behind Google's load balancer.
+- **Image size:** ~200 MB of the image is the Prisma CLI, kept so the same image can run migrations.
+
+### Troubleshooting
+
+- **Cloud Build "permission denied" on a new project:** newer projects run builds as the Compute Engine default service account. Grant it `roles/cloudbuild.builds.builder`.
+- **Local amd64 builds** (`docker build --platform linux/amd64`) are extremely slow on Apple Silicon under emulation. Let Cloud Build do it, and use a plain `docker build .` for local checks.
+
 ## Gotchas found while setting this up
 
 - `.npmrc` points this project at the public npm registry, because the global mirror (`npm.reg.lamia.fi`) lacks packages Nest 12 needs.

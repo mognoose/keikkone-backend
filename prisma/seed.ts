@@ -11,7 +11,9 @@ import { collectHashtags } from '../src/common/hashtags.js';
 import { slugify } from '../src/common/slug.js';
 
 if (process.env.NODE_ENV === 'production') {
-  throw new Error('Refusing to seed demo data (password123 users) into production');
+  throw new Error(
+    'Refusing to seed demo data (password123 users) into production',
+  );
 }
 
 const prisma = new PrismaClient({

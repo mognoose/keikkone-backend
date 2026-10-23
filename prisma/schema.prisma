@@ -1,7 +1,12 @@
 generator client {
-  provider        = "prisma-client"
-  output          = "../src/generated/prisma"
-  previewFeatures = ["postgresqlExtensions"]
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
+  previewFeatures     = ["postgresqlExtensions"]
+  // Stated explicitly instead of letting Prisma infer them from tsconfig/
+  // package.json: in the Docker build, generate runs before tsconfig is copied
+  // and guessed ".ts" imports, which crashed the compiled app.
+  moduleFormat        = "esm"
+  importFileExtension = "js"
 }
 
 datasource db {

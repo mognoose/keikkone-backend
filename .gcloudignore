@@ -1,0 +1,10 @@
+# Files Cloud Build does NOT upload. Starts from .gitignore (so .env and
+# node_modules never leave the machine), plus things the image doesn't need.
+#!include:.gitignore
+.git
+.github
+.agents
+.claude
+.windsurf
+test
+coverage
